@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.dim_key_integrity import evaluate_fact_design, find_fact_for_model
 from app.store import store
 
 ENVIRONMENTS = {"开发", "预发", "生产", "灰度"}
@@ -212,19 +213,25 @@ def _run_preflight_checks(entry: dict[str, Any]) -> dict[str, Any]:
         checks["items"].append({"check": "目标模型定义", "passed": False})
         checks["all_passed"] = False
 
-    # 检查2: 维度关联完整性
-    for f in store.rows("fact_design"):
-        if target_model in str(f.get("事实名称", "")):
-            related_dims = str(f.get("关联维度", "")).split(".")
-            published_dims = {
-                d.get("维度编码")
-                for d in store.rows("dim_definition") if d.get("status") == "已发布"
-            }
-            valid_dims = [d for d in related_dims if d and d.strip() in published_dims]
-            dim_check = len(valid_dims) == len([d for d in related_dims if d.strip()])
-            checks["items"].append({"check": f"关联维度就绪({len(valid_dims)}/维度)", "passed": dim_check})
-            if not dim_check:
-                checks["all_passed"] = False
+    # 检查2: 维度关联完整性（与模型校验、事实交付共用同一套键版本判定）
+    fact = find_fact_for_model(store, target_model)
+    if fact is not None:
+        evaluation = evaluate_fact_design(fact, store)
+        summary = evaluation["summary"]
+        dim_check = summary["passed"] == summary["total"] and summary["total"] > 0
+        checks["items"].append({
+            "check": f"关联维度就绪({summary['passed']}/{summary['total']})",
+            "passed": dim_check,
+            "fk_details": evaluation["details"],
+            "fact_dates": summary["fact_dates"],
+            "key_versions": sorted({
+                str(item["key_version"]) for item in evaluation["details"]
+                if item.get("key_version")
+            }),
+        })
+        if not dim_check:
+            checks["all_passed"] = False
+            checks["fk_failures"] = summary["failures"]
 
     # 检查3: ETL映射部署
     etl_ready = False

@@ -14,19 +14,38 @@ import time
 import uuid
 from typing import Any, Optional
 
+from app.services.dim_key_integrity import (  # 分区校验与事实设计共用同一实现
+    OUTSIDE_EFFECTIVE_PERIOD,
+    DimensionKeyIndex,
+    diff_foreign_keys,
+    evaluate_records,
+    fact_dimension_fields,
+    parse_fact_date,
+    refill_missing_keys,
+)
+
 # ---------------------------------------------------------------------------
 # 1. SCD 类型 2 处理
 # ---------------------------------------------------------------------------
 
 
-def scd_type2_handle(dimension_key: str, new_attrs: dict[str, Any], store: Any) -> dict[str, Any]:
+def scd_type2_handle(
+    dimension_key: str,
+    new_attrs: dict[str, Any],
+    store: Any,
+    *,
+    change_date: str | None = None,
+) -> dict[str, Any]:
     """对某个维度执行 SCD Type 2 变更：旧记录失效，新记录生效。
 
     1. 查找该维度当前生效记录（current_marker=1）
     2. 标记旧记录失效（current_marker=0, end_date=now）
     3. 插入新记录（current_marker=1, start_date=now）
+
+    change_date 用于回放历史换键：旧版本的失效日与新版本的生效日都取该日期，
+    避免非今天的变更把 9999-12-31 这类哨兵时间写进区间比较。
     """
-    now_str = time.strftime("%Y-%m-%d %H:%M:%S")
+    now_str = change_date or time.strftime("%Y-%m-%d %H:%M:%S")
     result: dict[str, Any] = {"dimension_key": dimension_key, "action": "scd2_change"}
 
     # 在内存 store 中查找属于该维度的记录
@@ -43,7 +62,8 @@ def scd_type2_handle(dimension_key: str, new_attrs: dict[str, Any], store: Any) 
         old["status"] = "已停用"
         expired_count += 1
 
-    # 插入新记录
+    # 插入新记录：沿用原键值集合（换键时由 new_attrs 覆盖），保证历史事实
+    # 仍能在旧版本里、新事实能在新版本里解析到该维度。
     new_id = max((int(r.get("id", 0)) for r in dim_table), default=0) + 1
     new_row = {
         "id": new_id,
@@ -52,6 +72,11 @@ def scd_type2_handle(dimension_key: str, new_attrs: dict[str, Any], store: Any) 
         "pending": True,
         "abnormal": False,
     }
+    inherited_keys = {
+        str(r.get("键值")) for r in old_records if str(r.get("键值", "")).strip()
+    }
+    if inherited_keys:
+        new_row["键值"] = ".".join(sorted(inherited_keys))
     # 合并新属性
     new_row.update({k: str(v) for k, v in new_attrs.items()})
     new_row["current_marker"] = "1"
@@ -153,15 +178,21 @@ class SurrogateKeyAllocator:
 # 3. 事实表分区写入与维度外键完整性校验
 # ---------------------------------------------------------------------------
 
-
 def fact_partition_write(
     fact_key: str,
     records: list[dict[str, Any]],
     partition_field: str,
     dim_fk_fields: dict[str, str],
     store: Any,
+    *,
+    auto_refill: bool = False,
+    previous_details: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """向事实表写入记录，同时校验维度外键完整性。
+
+    校验明细由 dim_key_integrity 统一产出：按每条记录的事实日期核对键版本，
+    已停用、跨生效期、未确认和完全不存在的键都不会被计为通过。交付只接纳
+    整个分区都通过的记录；失败分区的源记录原样保留，等待更正后重新校验。
 
     Args:
         fact_key: 事实表标识
@@ -169,44 +200,118 @@ def fact_partition_write(
         partition_field: 分区字段名
         dim_fk_fields: 维度外键映射 {field_name: dim_key}
         store: 数据仓库实例
+        auto_refill: 是否为跨生效期的历史事实补当前键版本
+        previous_details: 上一次校验的明细，用于核对实际改变的外键
 
     Returns:
-        {wrote: int, violations: list, partitions: dict}
+        {wrote, violations, partitions, fk_details, pass_rate, ...}
     """
-    result: dict[str, Any] = {"wrote": 0, "violations": [], "partitions": {}}
+    index = DimensionKeyIndex.from_store(store)
+    details, summary = evaluate_records(
+        fact_key=fact_key,
+        records=records,
+        dim_fk_fields=dim_fk_fields,
+        partition_field=partition_field,
+        index=index,
+    )
 
-    # 收集维度有效 keys
-    dim_table = store.rows("dim_definition")
-    valid_dim_keys: dict[str, set[str]] = {}
-    for field_name, dim_key in dim_fk_fields.items():
-        valid = {
-            str(r.get("维度编码", ""))
-            for r in dim_table
-            if str(r.get("current_marker", "1")) == "1"
-        }
-        valid_dim_keys[field_name] = valid
+    refills: list[dict[str, Any]] = []
+    if auto_refill and summary["failures"]:
+        for failure in summary["failures"]:
+            if failure["status"] != OUTSIDE_EFFECTIVE_PERIOD:
+                continue
+            # 只有“事实日期落在所有版本区间之外”的历史事实需要补键；
+            # 已停用、未确认和不存在都属于需要人工更正的键，补版本只会掩盖问题。
+            refill = refill_missing_keys(
+                store,
+                failure["dim_code"],
+                parse_fact_date(failure.get("fact_date")),
+                key_value=failure.get("value", ""),
+            )
+            if refill["refilled"]:
+                refills.append(refill)
+        if refills:
+            # 补键后按同一批记录、同一批分区整体重算：跨版本边界的分区
+            # 不会因为上一次已经通过而被跳过。
+            index = DimensionKeyIndex.from_store(store)
+            details, summary = evaluate_records(
+                fact_key=fact_key,
+                records=records,
+                dim_fk_fields=dim_fk_fields,
+                partition_field=partition_field,
+                index=index,
+            )
+
+    result: dict[str, Any] = {
+        "wrote": 0,
+        "violations": [],
+        "partitions": {},
+        "records": [dict(record) for record in records],
+        "fk_details": details,
+        "pass_rate": summary["pass_rate"],
+        "fact_dates": summary["fact_dates"],
+        "version_boundaries": summary["version_boundaries"],
+        "status_counts": summary["status_counts"],
+        "summary": summary,
+        "refills": refills,
+        "delivered_partitions": [],
+        "blocked_partitions": [],
+        "corrections": [],
+        "changed_foreign_keys": [],
+    }
+
+    delivered_indexes: set[int] = set()
+    record_partitions = {
+        int(item["record_index"]): item["partition"]
+        for item in details
+        if "record_index" in item
+    }
+    for partition, bucket in summary["partitions"].items():
+        if bucket["failed"] == 0:
+            result["delivered_partitions"].append(partition)
+            for item in details:
+                if item["partition"] == partition:
+                    delivered_indexes.add(int(item["record_index"]))
+        else:
+            result["blocked_partitions"].append({
+                "partition": partition,
+                "failed": bucket["failed"],
+                "statuses": bucket["statuses"],
+                "fact_dates": bucket["fact_dates"],
+            })
+            for offset, record in enumerate(records):
+                if record_partitions.get(offset) != partition:
+                    continue
+                # 整分区拦截：源记录原样保留，更正后重新校验同一批记录。
+                result["corrections"].append({
+                    "record_index": offset,
+                    "partition": partition,
+                    "fact_date": bucket["fact_dates"],
+                    "record": dict(record),
+                })
+
+    for item in details:
+        if not item["passes"]:
+            result["violations"].append({
+                "field": item["field"],
+                "value": item["value"],
+                "reason": (
+                    f"维度 {item['dim_code']} 在事实日期 {item['fact_date'] or '未知'} "
+                    f"{item['status_label']} {item['value'] or '(空)'}"
+                ),
+                "status": item["status"],
+                "fact_date": item["fact_date"],
+                "partition": item["partition"],
+                "key_version": item["key_version"],
+            })
 
     fact_table = store.rows("fact_design")
     max_id = max((int(r.get("id", 0)) for r in fact_table), default=0)
-
-    for rec in records:
-        violations = []
-        for field_name, dim_key in dim_fk_fields.items():
-            fk_value = str(rec.get(field_name, ""))
-            valid_keys = valid_dim_keys.get(field_name, set())
-            if fk_value and fk_value not in valid_keys:
-                violations.append({
-                    "field": field_name,
-                    "value": fk_value,
-                    "reason": f"维度 {dim_key} 不存在有效键值 {fk_value}",
-                })
-
-        if violations:
-            result["violations"].extend(violations)
+    for offset, record in enumerate(records):
+        if offset not in delivered_indexes:
             continue
-
         max_id += 1
-        partition_value = str(rec.get(partition_field, "default"))
+        partition_value = record_partitions.get(offset, "default")
         result["partitions"].setdefault(partition_value, 0)
         result["partitions"][partition_value] += 1
 
@@ -216,12 +321,49 @@ def fact_partition_write(
             "status": "已设计",
             "pending": True,
             "abnormal": False,
+            "_partition_record": True,
         }
-        row.update({k: str(v) for k, v in rec.items()})
+        row.update({k: str(v) for k, v in record.items()})
         fact_table.append(row)
         result["wrote"] += 1
 
+    result["changed_foreign_keys"] = diff_foreign_keys(previous_details or [], details)
     return result
+
+
+def partition_field_name(partition_field: str | None) -> str:
+    """从“dt DATE”这类声明里取出真正的分区字段名。"""
+    if not partition_field:
+        return ""
+    return str(partition_field).strip().split()[0].split("=")[-1]
+
+
+def fact_design_partitions(
+    fact: dict[str, Any],
+    records: list[dict[str, Any]],
+    store: Any,
+    *,
+    auto_refill: bool = True,
+    previous_details: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """事实设计发布前按外键校验结果安排分区补键与交付。
+
+    与 model_validate 的完整性校验共用 dim_key_integrity 的明细：
+    可交付的分区继续走 fact_partition_write，需更正的分区保留源记录。
+    """
+    index = DimensionKeyIndex.from_store(store)
+    dim_fk_fields = fact_dimension_fields(fact, index)
+    partition_field = partition_field_name(fact.get("分区字段", ""))
+    return fact_partition_write(
+        fact_key=fact.get("事实名称", ""),
+        records=records,
+        partition_field=partition_field,
+        dim_fk_fields=dim_fk_fields,
+        store=store,
+        auto_refill=auto_refill,
+        previous_details=previous_details,
+    )
+
 
 
 # ---------------------------------------------------------------------------

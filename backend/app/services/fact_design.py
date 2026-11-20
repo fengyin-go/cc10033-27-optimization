@@ -2,16 +2,28 @@
 
 增强能力：
 - 事实表名称标准化校验（前缀fact_）
-- 维度关联完整性检查：关联的维度必须已在dim_definition中定义
-- 消费 dim.published 通道确认关联维度可用
+- 维度关联完整性检查：关联维度必须已定义，且键在事实日期下处于已确认的
+  生效期内；定义存在不等于键可用
+- 与 model_validate、deploy_pipeline 共用 dim_key_integrity 的外键明细
+- 登记/发布事实时按外键校验结果安排分区补键：只交付整分区通过的数据，
+  需要更正的分区保留源记录，重新校验会核对实际改变的外键
 - 发布事实时触发度量配置和聚合层自动建议
 """
 from __future__ import annotations
 
-import re
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.dim_key_integrity import (
+    DimensionKeyIndex,
+    collect_stored_fact_records,
+    evaluate_fact_design,
+    fact_dimension_fields,
+    parse_fact_date,
+    split_dim_codes,
+    synthesize_design_records,
+)
+from app.services.pipeline import fact_design_partitions
 from app.store import store
 
 
@@ -57,6 +69,23 @@ class FactDesignService(BaseModuleService):
         if entry is None:
             return None, missing
 
+        # 登记时带上了分区记录：先按统一规则校验并只交付通过的分区。
+        partition_records = values.get("分区记录")
+        if isinstance(partition_records, list) and partition_records:
+            delivery = fact_design_partitions(
+                entry, [dict(item) for item in partition_records], store,
+                auto_refill=bool(values.get("自动补键", True)),
+            )
+            entry["_fk_details"] = delivery["fk_details"]
+            entry["_fk_summary"] = delivery["summary"]
+            entry["_delivery"] = {
+                "pass_rate": delivery["pass_rate"],
+                "delivered_partitions": delivery["delivered_partitions"],
+                "blocked_partitions": delivery["blocked_partitions"],
+                "corrections": delivery["corrections"],
+            }
+            entry["_partition_records"] = delivery["records"]
+
         # 发布事实表定义到数据通道
         store.channel.publish("fact.defined", {
             "fact_name": entry["事实名称"],
@@ -84,10 +113,33 @@ class FactDesignService(BaseModuleService):
             return None, message
 
         if action == "发布事实":
-            # 验证关联维度完整性
-            dim_validation = _validate_fact_dim_completeness(entry)
-            if not dim_validation["valid"]:
-                return None, dim_validation["message"]
+            # 用统一的外键明细判断能否发布：定义存在但键已停用/跨生效期不算通过。
+            validation = _validate_fact_dim_completeness(entry)
+            if not validation["valid"]:
+                return None, validation["message"]
+
+            # 事实交付与校验共用同一份明细，按分区安排补键和拦截。
+            delivery = _deliver_fact_partitions(entry)
+            entry["_fk_details"] = delivery["fk_details"]
+            entry["_fk_summary"] = delivery["summary"]
+            entry["_delivery"] = {
+                "pass_rate": delivery["pass_rate"],
+                "delivered_partitions": delivery["delivered_partitions"],
+                "blocked_partitions": delivery["blocked_partitions"],
+                "corrections": delivery["corrections"],
+                "fact_dates": delivery["fact_dates"],
+                "key_versions": sorted({
+                    str(item["key_version"]) for item in delivery["fk_details"]
+                    if item.get("key_version")
+                }),
+            }
+            if delivery["blocked_partitions"]:
+                return entry, (
+                    f"事实表已发布，但分区 "
+                    f"{'、'.join(str(item['partition']) for item in delivery['blocked_partitions'])} "
+                    f"存在维度外键问题，已保留源记录等待更正；"
+                    f"通过 {delivery['pass_rate']}"
+                )
 
             store.channel.publish("fact.published", {
                 "fact_name": entry["事实名称"],
@@ -97,6 +149,13 @@ class FactDesignService(BaseModuleService):
                 "measures": entry.get("度量字段", ""),
                 "update_mode": entry.get("更新模式"),
                 "entry_id": entry["id"],
+                "fk_pass_rate": delivery["pass_rate"],
+                "fact_dates": delivery["fact_dates"],
+                "key_versions": sorted({
+                    str(item["key_version"]) for item in delivery["fk_details"]
+                    if item.get("key_version")
+                }),
+                "fk_details": delivery["fk_details"],
             })
 
             # 自动建议度量配置
@@ -124,6 +183,34 @@ class FactDesignService(BaseModuleService):
             dims = str(row.get("关联维度", "")).split(".")
             dim_matrix[fact_name] = [d for d in dims if d]
         base["dimension_association_matrix"] = dim_matrix
+
+        # 外键交付概况：通过率、被拦截分区和采用的键版本全部来自同一份明细。
+        base["fk_pass_rate"] = {}
+        base["blocked_partitions"] = {}
+        base["key_versions_used"] = []
+        base["version_boundaries"] = []
+        versions: set[str] = set()
+        boundaries: set[str] = set()
+        for row in store.rows(self.MODULE):
+            summary = row.get("_fk_summary")
+            if not summary:
+                continue
+            fact_name = row.get("事实名称", "")
+            base["fk_pass_rate"][fact_name] = summary["pass_rate"]
+            blocked = [
+                str(item["partition"])
+                for item in (row.get("_delivery") or {}).get("blocked_partitions", [])
+            ]
+            if blocked:
+                base["blocked_partitions"][fact_name] = blocked
+            versions.update(
+                str(item["key_version"])
+                for item in row.get("_fk_details", [])
+                if item.get("key_version")
+            )
+            boundaries.update(summary.get("version_boundaries", []))
+        base["key_versions_used"] = sorted(versions)
+        base["version_boundaries"] = sorted(boundaries)
         return base
 
 
@@ -132,23 +219,71 @@ def _validate_dimensions(dim_str: str) -> list[str]:
     if not dim_str.strip():
         return []
     dim_codes = [d.strip() for d in dim_str.split(".") if d.strip()]
-    existing_dims = {row.get("维度编码") for row in store.rows("dim_definition")}
-    valid = [d for d in dim_codes if d in existing_dims]
-    return valid
+    index = DimensionKeyIndex.from_store(store)
+    return [d for d in dim_codes if index.known(d)]
 
 
 def _validate_fact_dim_completeness(entry: dict[str, Any]) -> dict[str, Any]:
-    """校验事实表关联维度完整性。"""
+    """校验事实表关联维度完整性：定义存在且键版本可用。"""
     related_dims = str(entry.get("关联维度", "")).strip()
     if not related_dims:
         return {"valid": False, "message": "事实表至少需要关联一个维度"}
 
-    dim_codes = [d.strip() for d in related_dims.split(".") if d.strip()]
-    existing_dims = {row.get("维度编码") for row in store.rows("dim_definition")}
-    missing = [d for d in dim_codes if d not in existing_dims]
+    dim_codes = split_dim_codes(related_dims)
+    index = DimensionKeyIndex.from_store(store)
+    missing = [d for d in dim_codes if not index.known(d)]
     if missing:
         return {"valid": False, "message": f"维度 {'、'.join(missing)} 未定义，请先创建维度定义"}
+
+    # 只拦“没有任何分区记录可交付”的情况；具体的键版本问题交给交付环节
+    # 按分区处理，避免因为某个历史分区有问题就整表无法发布。
+    records = collect_stored_fact_records(store, str(entry.get("事实名称", "")))
+    if not records:
+        records = [dict(item) for item in entry.get("_partition_records") or []]
+    candidate = _delivery_records(entry) if not records else records
+    evaluation = evaluate_fact_design(entry, store, records=candidate)
+    summary = evaluation["summary"]
+    if summary["passed"] == 0 and summary["total"] > 0:
+        reasons = "、".join(
+            f"{item['dim_code']}({item['status_label']})" for item in summary["failures"][:6]
+        )
+        return {"valid": False, "message": f"维度键全部不可用：{reasons}，请先确认维度键版本"}
     return {"valid": True, "message": ""}
+
+
+def _delivery_records(entry: dict[str, Any]) -> list[dict[str, Any]]:
+    """取回待校验的同一批分区记录。
+
+    已落库的分区记录优先；没有的话用一次性登记时提交的批次；
+    两者都没有时，设计自身的维度关联就是一条样本记录。
+    """
+    submitted = [dict(item) for item in entry.get("_partition_records") or []]
+    # 一次性登记时提交的整批记录优先：已交付的分区已经落库，被拦截的
+    # 分区只留在批次里，必须一起取回才能保证重复校验覆盖同一批记录。
+    records = submitted or collect_stored_fact_records(
+        store, str(entry.get("事实名称", ""))
+    )
+    if not records:
+        # 首次发布没有独立分区记录时，用设计声明的真实键值生成样本记录。
+        index = DimensionKeyIndex.from_store(store)
+        records = synthesize_design_records(
+            entry,
+            fact_dimension_fields(entry, index),
+            parse_fact_date(entry.get("_fact_date")),
+            index,
+        )
+    return records
+
+
+def _deliver_fact_partitions(entry: dict[str, Any]) -> dict[str, Any]:
+    """事实设计发布时按外键校验结果安排分区补键和交付。"""
+    return fact_design_partitions(
+        entry,
+        _delivery_records(entry),
+        store,
+        auto_refill=True,
+        previous_details=entry.get("_fk_details") or [],
+    )
 
 
 def _suggest_measures(fact: dict[str, Any]) -> None:
